@@ -557,17 +557,33 @@ class DFAlgQueryCompiler(BaseQueryCompiler):
 
     def drop(self, index=None, columns=None, errors: str = "raise"):
         if index is not None:
-            raise NotImplementedError("Row drop")
+            # Only column drop is supported by the HDK engine
+            raise NotImplementedError("Index drop")
         if errors != "raise":
             raise NotImplementedError(
                 "This lazy query compiler will always "
                 + "raise an error on invalid columns."
             )
-        return self.__constructor__(
-            self._modin_frame.take_2d_labels_or_positional(
-                row_labels=index, col_labels=self.columns.drop(columns)
-            )
+
+        columns = self.columns.drop(columns)
+        new_frame = self._modin_frame.take_2d_labels_or_positional(
+            row_labels=index, col_labels=columns
         )
+
+        # If all columns are dropped and the index is trivial, we are
+        # not able to restore it, since we don't know the number of rows.
+        # In this case, we calculate the index from the current frame.
+        if len(columns) == 0 and new_frame._index_cache is None:
+            if self._modin_frame._index_cache is not None:
+                new_frame._index_cache = self._modin_frame._index_cache
+            else:
+                # Lazy execution must be disabled before the index calculation
+                mode = self._modin_frame.force_execution_mode
+                self._modin_frame.force_execution_mode = None
+                new_frame._index_cache = self._modin_frame.index
+                self._modin_frame.force_execution_mode = mode
+
+        return self.__constructor__(new_frame)
 
     def dropna(self, axis=0, how=no_default, thresh=no_default, subset=None):
         if thresh is not no_default or axis != 0:
