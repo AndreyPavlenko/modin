@@ -636,6 +636,7 @@ def df_equals(df1, df2):
             check_index_type=False,
             check_column_type=False,
             check_categorical=False,
+            check_freq=False,
         )
         df_categories_equals(df1, df2)
     elif isinstance(df1, pandas.Index) and isinstance(df2, pandas.Index):
