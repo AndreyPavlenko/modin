@@ -1240,6 +1240,7 @@ class DataFrame(BasePandasDataset):
             if (
                 is_list_like(value)
                 and not isinstance(value, (pandas.Series, Series))
+                and len(self.index) != 0
                 and len(value) != len(self.index)
             ):
                 raise ValueError(

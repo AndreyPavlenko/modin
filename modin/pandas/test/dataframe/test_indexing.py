@@ -40,7 +40,7 @@ from modin.pandas.test.utils import (
     extra_test_parameters,
     default_to_pandas_ignore_string,
 )
-from modin.config import NPartitions, MinPartitionSize
+from modin.config import NPartitions, MinPartitionSize, StorageFormat
 from modin.utils import get_current_execution
 from modin.test.test_utils import warns_that_defaulting_to_pandas
 from modin.pandas.indexing import is_range_like
@@ -56,6 +56,9 @@ matplotlib.use("Agg")
 # TODO(https://github.com/modin-project/modin/issues/3655): catch all instances
 # of defaulting to pandas.
 pytestmark = pytest.mark.filterwarnings(default_to_pandas_ignore_string)
+
+# Initialize env for storage format detection in @pytest.mark.xfail
+pd.DataFrame()
 
 
 def eval_setitem(md_df, pd_df, value, col=None, loc=None):
@@ -1267,7 +1270,19 @@ def test_reset_index(data):
     df_equals(modin_df_cp, pd_df_cp)
 
 
-@pytest.mark.parametrize("data", test_data_values, ids=test_data_keys)
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param(test_data["int_data"]),
+        pytest.param(
+            test_data["float_nan_data"],
+            marks=pytest.mark.xfail(
+                StorageFormat.get() == "Hdk",
+                reason="https://github.com/modin-project/modin/issues/2896",
+            ),
+        ),
+    ],
+)
 def test_reset_index_multiindex_groupby(data):
     # GH#4394
     modin_df, pandas_df = create_test_dfs(data)
@@ -1915,6 +1930,10 @@ def test___setitem__(data):
     df_equals(modin_df, pandas_df)
 
 
+@pytest.mark.xfail(
+    StorageFormat.get() == "Hdk",
+    reason="https://github.com/intel-ai/hdk/issues/165",
+)
 def test___setitem__partitions_aligning():
     # from issue #2390
     modin_df = pd.DataFrame({"a": [1, 2, 3]})
@@ -1944,11 +1963,15 @@ def test___setitem__partitions_aligning():
     df_equals(md_df, pd_df)
 
 
+@pytest.mark.xfail(
+    StorageFormat.get() == "Hdk", reason="https://github.com/intel-ai/hdk/issues/165"
+)
 def test___setitem__with_mismatched_partitions():
     with ensure_clean(".csv") as fname:
         np.savetxt(fname, np.random.randint(0, 100, size=(200_000, 99)), delimiter=",")
-        modin_df = pd.read_csv(fname)
-        pandas_df = pandas.read_csv(fname)
+        # Use header=None to avoid duplicate column names
+        modin_df = pd.read_csv(fname, header=None)
+        pandas_df = pandas.read_csv(fname, header=None)
         modin_df["new"] = pd.Series(list(range(len(modin_df))))
         pandas_df["new"] = pandas.Series(list(range(len(pandas_df))))
         df_equals(modin_df, pandas_df)
@@ -1982,6 +2005,9 @@ def test___setitem__mask():
         modin_df[array] = 20
 
 
+@pytest.mark.skipif(
+    StorageFormat.get() == "Hdk", reason="https://github.com/intel-ai/hdk/issues/165"
+)
 @pytest.mark.parametrize(
     "data",
     [
