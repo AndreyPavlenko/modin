@@ -21,7 +21,13 @@ from modin.core.dataframe.base.interchange.dataframe_protocol.dataframe import (
 from modin.experimental.core.storage_formats.hdk.query_compiler import (
     DFAlgQueryCompiler,
 )
-from .utils import LazyProxyCategoricalDtype
+from .utils import (
+    LazyProxyCategoricalDtype,
+    encode_col_name,
+    decode_col_name,
+    IDX_COL_NAME,
+    ROWID_COL_NAME,
+)
 from ..partitioning.partition_manager import HdkOnNativeDataframePartitionManager
 
 from pandas.core.indexes.api import ensure_index, Index, MultiIndex, RangeIndex
@@ -208,25 +214,12 @@ class HdkOnNativeDataframe(PandasDataframe):
         if partitions is not None:
             self._filter_empties()
 
-        # This frame uses encoding for column names to support exotic
-        # (e.g. non-string and reserved words) column names. Encoded
-        # names are used in HDK tables and corresponding Arrow tables.
-        # If we import Arrow table, we have to rename its columns for
-        # proper processing.
         if self._has_arrow_table() and self._partitions.size > 0:
             assert self._partitions.size == 1
             table = self._partitions[0][0].get()
-            column_names = table.column_names
-            if len(table) > 0 and column_names[0] != f"F_{self._table_cols[0]}":
-                column_names = [f"F_{col}" for col in column_names]
-                table = table.rename_columns(column_names)
-                self._partitions[0][
-                    0
-                ] = self._partition_mgr_cls._partition_class.put_arrow(table)
-
             for i, t in enumerate(dtypes):
                 if isinstance(t, LazyProxyCategoricalDtype):
-                    dtypes[i] = t._new(table, column_names[i])
+                    dtypes[i] = t._new(table, table.column_names[i])
 
         self._uses_rowid = uses_rowid
         self._force_execution_mode = force_execution_mode
@@ -275,7 +268,7 @@ class HdkOnNativeDataframe(PandasDataframe):
         -------
         InputRefExpr
         """
-        if col == "__rowid__":
+        if col == ROWID_COL_NAME:
             return InputRefExpr(self, col, get_dtype(int))
         return InputRefExpr(self, col, self.get_dtype(col))
 
@@ -508,7 +501,7 @@ class HdkOnNativeDataframe(PandasDataframe):
         def generate_by_name(by):
             """Generate unuqie name for `by` column in the resulted frame."""
             if as_index:
-                return f"__index__0_{by}"
+                return f"{IDX_COL_NAME}0_{by}"
             elif by in agg_cols:
                 # Aggregation columns are more prioritized than the 'by' cols,
                 # so in case of naming conflicts, we drop 'by' cols.
@@ -683,6 +676,7 @@ class HdkOnNativeDataframe(PandasDataframe):
             columns=self.columns,
             dtypes=dtypes,
             op=new_op,
+            index=self._index_cache,
             index_cols=self._index_cols,
             force_execution_mode=self._force_execution_mode,
         )
@@ -753,6 +747,7 @@ class HdkOnNativeDataframe(PandasDataframe):
             columns=self.columns,
             dtypes=dtypes,
             op=new_op,
+            index=self._index_cache,
             index_cols=self._index_cols,
             force_execution_mode=self._force_execution_mode,
         )
@@ -809,6 +804,7 @@ class HdkOnNativeDataframe(PandasDataframe):
             columns=self.columns,
             dtypes=new_dtypes,
             op=new_op,
+            index=self._index_cache,
             index_cols=self._index_cols,
             force_execution_mode=self._force_execution_mode,
         )
@@ -1016,8 +1012,8 @@ class HdkOnNativeDataframe(PandasDataframe):
                         exprs[col] = frame.ref(col)
                 else:
                     assert index_width == 1, "unexpected index width"
-                    aligned_index = ["__index__"]
-                    exprs["__index__"] = frame.ref("__rowid__")
+                    aligned_index = [IDX_COL_NAME]
+                    exprs[IDX_COL_NAME] = frame.ref(ROWID_COL_NAME)
                     aligned_index_dtypes = [get_dtype(int)]
                     uses_rowid = True
                 aligned_dtypes = aligned_index_dtypes + new_dtypes
@@ -1079,12 +1075,15 @@ class HdkOnNativeDataframe(PandasDataframe):
 
         lhs = self._maybe_materialize_rowid()
         reset_index_names = False
+        new_columns_dtype = self.columns.dtype
         for rhs in other_modin_frames:
             rhs = rhs._maybe_materialize_rowid()
             if len(lhs._index_cols) != len(rhs._index_cols):
                 raise NotImplementedError(
                     "join by indexes with different sizes is not supported"
                 )
+            if new_columns_dtype != rhs.columns.dtype:
+                new_columns_dtype = None
 
             reset_index_names = reset_index_names or lhs._index_cols != rhs._index_cols
 
@@ -1116,7 +1115,7 @@ class HdkOnNativeDataframe(PandasDataframe):
             )
 
             new_columns = Index.__new__(
-                Index, data=new_columns, dtype=self.columns.dtype
+                Index, data=new_columns, dtype=new_columns_dtype
             )
             lhs = lhs.__constructor__(
                 dtypes=lhs._dtypes_for_exprs(exprs),
@@ -1244,6 +1243,7 @@ class HdkOnNativeDataframe(PandasDataframe):
                 columns=self.columns,
                 dtypes=self._dtypes_for_exprs(exprs),
                 op=TransformNode(self, exprs),
+                index=self._index_cache,
                 index_cols=self._index_cols,
                 force_execution_mode=self._force_execution_mode,
             )
@@ -1259,6 +1259,7 @@ class HdkOnNativeDataframe(PandasDataframe):
                 columns=self.columns,
                 dtypes=self._dtypes_for_exprs(exprs),
                 op=TransformNode(self, exprs),
+                index=self._index_cache,
                 index_cols=self._index_cols,
                 force_execution_mode=self._force_execution_mode,
             )
@@ -1300,6 +1301,7 @@ class HdkOnNativeDataframe(PandasDataframe):
                 columns=new_columns,
                 dtypes=self._dtypes_for_exprs(exprs),
                 op=TransformNode(base, exprs),
+                index=self._index_cache,
                 index_cols=self._index_cols,
                 force_execution_mode=self._force_execution_mode,
             )
@@ -1342,6 +1344,7 @@ class HdkOnNativeDataframe(PandasDataframe):
             columns=new_columns,
             dtypes=self._dtypes_for_exprs(exprs),
             op=TransformNode(self, exprs),
+            index=self._index_cache,
             index_cols=self._index_cols,
             force_execution_mode=self._force_execution_mode,
         )
@@ -1373,6 +1376,7 @@ class HdkOnNativeDataframe(PandasDataframe):
             columns=self.columns,
             dtypes=self._dtypes,
             op=TransformNode(self, exprs),
+            index=self._index_cache,
             index_cols=self._index_cols,
             force_execution_mode=self._force_execution_mode,
         )
@@ -1478,7 +1482,7 @@ class HdkOnNativeDataframe(PandasDataframe):
             base = self
 
             # If index is preserved and we have no index columns then we
-            # need to create one using __rowid__ virtual column.
+            # need to create one using {ROWID_COL_NAME} virtual column.
             if self._index_cols is None:
                 base = base._materialize_rowid()
 
@@ -1548,8 +1552,8 @@ class HdkOnNativeDataframe(PandasDataframe):
             exprs = translate_exprs_to_base(self._op.exprs, base)
             exprs = replace_frame_in_exprs(exprs, base, filtered_base)
             if base._index_cols is None:
-                exprs["__index__"] = filtered_base.ref("__index__")
-                exprs.move_to_end("__index__", last=False)
+                exprs[IDX_COL_NAME] = filtered_base.ref(IDX_COL_NAME)
+                exprs.move_to_end(IDX_COL_NAME, last=False)
 
         return self.__constructor__(
             columns=self.columns,
@@ -1584,15 +1588,17 @@ class HdkOnNativeDataframe(PandasDataframe):
         HdkOnNativeDataframe
             The new frame.
         """
+        name = None if self._index_cache is None else self._index_cache.name
+        name = IDX_COL_NAME if name is None else self._mangle_index_names([name])[0]
         exprs = OrderedDict()
-        exprs["__index__"] = self.ref("__rowid__")
+        exprs[name] = self.ref(ROWID_COL_NAME)
         for col in self._table_cols:
             exprs[col] = self.ref(col)
         return self.__constructor__(
             columns=self.columns,
             dtypes=self._dtypes_for_exprs(exprs),
             op=TransformNode(self, exprs),
-            index_cols=["__index__"],
+            index_cols=[name],
             uses_rowid=True,
             force_execution_mode=self._force_execution_mode,
         )
@@ -1787,15 +1793,19 @@ class HdkOnNativeDataframe(PandasDataframe):
         new_columns = []
 
         for col, expr in exprs.items():
-            if expr.column == "__rowid__" and "F___rowid__" not in table.schema.names:
-                arr = pyarrow.array(np.arange(0, table.num_rows))
-                table = table.append_column("F___rowid__", arr)
+            col_name = expr.column
+            if col_name == ROWID_COL_NAME:
+                if ROWID_COL_NAME not in table.schema.names:
+                    arr = pyarrow.array(np.arange(0, table.num_rows))
+                    table = table.append_column(ROWID_COL_NAME, arr)
+            elif not isinstance(col_name, str) or not col_name.startswith(IDX_COL_NAME):
+                col_name = encode_col_name(col_name)
 
-            field = table.schema.field(f"F_{expr.column}")
+            field = table.schema.field(col_name)
             if col != expr.column:
-                field = field.with_name(f"F_{col}")
+                field = field.with_name(encode_col_name(col))
             new_fields.append(field)
-            new_columns.append(table.column(f"F_{expr.column}"))
+            new_columns.append(table.column(col_name))
 
         new_schema = pyarrow.schema(new_fields)
 
@@ -1876,15 +1886,15 @@ class HdkOnNativeDataframe(PandasDataframe):
                         RangeIndex, data=range(obj.num_rows)
                     )
                 else:
-                    index_at = obj.drop([f"F_{col}" for col in self.columns])
+                    col_names = [
+                        n for n in obj.column_names if not n.startswith(IDX_COL_NAME)
+                    ]
+                    index_at = obj.drop(col_names)
                     index_df = index_at.to_pandas()
-                    index_df.set_index(
-                        [f"F_{col}" for col in self._index_cols], inplace=True
-                    )
-                    index_df.index.rename(
-                        self._index_names(self._index_cols), inplace=True
-                    )
-                    self._index_cache = index_df.index
+                    index_df.set_index(self._index_cols, inplace=True)
+                    idx = index_df.index
+                    idx.rename(self._index_names(self._index_cols), inplace=True)
+                    self._index_cache = idx
 
     def _get_index(self):
         """
@@ -1935,18 +1945,15 @@ class HdkOnNativeDataframe(PandasDataframe):
             if self._index_cols:
                 at = at.drop(self._index_cols)
 
-            index_df = pd.DataFrame(data={}, index=new_index.copy())
+            new_index = new_index.copy()
+            index_names = self._mangle_index_names(new_index.names)
+            new_index.names = index_names
+            index_df = pd.DataFrame(data={}, index=new_index)
             index_df = index_df.reset_index()
-
             index_at = pyarrow.Table.from_pandas(index_df)
 
             for i, field in enumerate(at.schema):
                 index_at = index_at.append_column(field, at.column(i))
-
-            index_names = self._mangle_index_names(new_index.names)
-            index_at = index_at.rename_columns(
-                index_names + [f"F_{c}" for c in self.columns]
-            )
 
             return self.from_arrow(index_at, index_names, new_index, self.columns)
 
@@ -2048,6 +2055,7 @@ class HdkOnNativeDataframe(PandasDataframe):
             columns=new_columns,
             dtypes=self._dtypes.tolist(),
             op=TransformNode(self, exprs),
+            index=self._index_cache,
             index_cols=self._index_cols,
             force_execution_mode=self._force_execution_mode,
         )
@@ -2210,7 +2218,7 @@ class HdkOnNativeDataframe(PandasDataframe):
         names = self._mangle_index_names([name])
         exprs = OrderedDict()
         if self._index_cols is None:
-            exprs[names[0]] = self.ref("__rowid__")
+            exprs[names[0]] = self.ref(ROWID_COL_NAME)
         else:
             exprs[names[0]] = self.ref(self._index_cols[0])
 
@@ -2288,18 +2296,20 @@ class HdkOnNativeDataframe(PandasDataframe):
         if self._force_execution_mode == "lazy":
             raise RuntimeError("unexpected to_pandas triggered on lazy frame")
 
+        if len(self._partitions) == 0:
+            return pd.DataFrame(columns=self.columns, index=self.index)
+
         df = self._partition_mgr_cls.to_pandas(self._partitions)
 
         # If we make dataframe from Arrow table then we might need to set
         # index columns.
         if len(df.columns) != len(self.columns):
             assert self._index_cols
-            idx_col_names = [f"F_{col}" for col in self._index_cols]
             if self._index_cache is not None:
-                df.drop(columns=idx_col_names, inplace=True)
+                df.drop(columns=self._index_cols, inplace=True)
                 df.index = self._index_cache.copy()
             else:
-                df.set_index(idx_col_names, inplace=True)
+                df.set_index(self._index_cols, inplace=True)
                 df.index.rename(self._index_names(self._index_cols), inplace=True)
         else:
             assert self._index_cols is None
@@ -2347,15 +2357,13 @@ class HdkOnNativeDataframe(PandasDataframe):
         str
             Demangled index name.
         """
-        if col == "__index__":
+        if col == IDX_COL_NAME:
             return None
 
-        match = re.search("__index__\\d+_(.*)", col)
+        match = re.search(f"{IDX_COL_NAME}\\d+_(.*)", col)
         if match:
             name = match.group(1)
-            if name in ("__None__", MODIN_UNNAMED_SERIES_LABEL):
-                return None
-            return name
+            return None if name == MODIN_UNNAMED_SERIES_LABEL else decode_col_name(name)
 
         return col
 
@@ -2378,7 +2386,7 @@ class HdkOnNativeDataframe(PandasDataframe):
 
         if self._index_cols is not None:
             for idx_col in self._index_cols:
-                if col == idx_col or re.match(f"__index__\\d+_{col}", idx_col):
+                if col == idx_col or re.match(f"{IDX_COL_NAME}\\d+_{col}", idx_col):
                     return idx_col
 
         raise ValueError(f"Unknown column '{col}'")
@@ -2413,30 +2421,40 @@ class HdkOnNativeDataframe(PandasDataframe):
         # it into columns either because, otherwise, we don't know
         # the number of rows and, thus, unable to restore the index.
         # That's what we usually have for arrow tables and execution
-        # result. Unnamed index is renamed to __index__. Also all
+        # result. Unnamed index is renamed to {IDX_COL_PREF}. Also all
         # columns get 'F_' prefix to handle names unsupported in HDK.
-        elif len(new_index) == 0 or (
-            len(new_columns) != 0 and cls._is_trivial_index(new_index)
-        ):
+        elif (
+            len(new_index) == 0
+            and not isinstance(new_index, MultiIndex)
+            and new_index.name is None
+        ) or (len(new_columns) != 0 and cls._is_trivial_index(new_index)):
             index_cols = None
         else:
             orig_index_names = new_index.names
             orig_df = df
-
             index_cols = cls._mangle_index_names(new_index.names)
             df.index.names = index_cols
             df = df.reset_index()
-
             orig_df.index.names = orig_index_names
+
         new_dtypes = df.dtypes
-        df = df.add_prefix("F_")
+
+        def encoder(n):
+            return n if n == MODIN_UNNAMED_SERIES_LABEL else encode_col_name(n, False)
+
+        if index_cols is not None:
+            cols = index_cols.copy()
+            cols.extend([encoder(n) for n in df.columns[len(index_cols) :]])
+            df.columns = cols
+        else:
+            df = df.rename(columns=encoder)
 
         (
             new_parts,
             new_lengths,
             new_widths,
             unsupported_cols,
-        ) = cls._partition_mgr_cls.from_pandas(df, True)
+        ) = cls._partition_mgr_cls.from_pandas(df, True, False)
 
         if len(unsupported_cols) > 0:
             ErrorMessage.single_warning(
@@ -2476,10 +2494,7 @@ class HdkOnNativeDataframe(PandasDataframe):
         list of str
             Mangled names.
         """
-        return [
-            f"__index__{i}_{'__None__' if n is None else n}"
-            for i, n in enumerate(names)
-        ]
+        return [f"{IDX_COL_NAME}{i}_{encode_col_name(n)}" for i, n in enumerate(names)]
 
     @classmethod
     def from_arrow(cls, at, index_cols=None, index=None, columns=None):
