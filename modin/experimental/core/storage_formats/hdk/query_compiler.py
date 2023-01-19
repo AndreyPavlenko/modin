@@ -572,16 +572,9 @@ class DFAlgQueryCompiler(BaseQueryCompiler):
 
         # If all columns are dropped and the index is trivial, we are
         # not able to restore it, since we don't know the number of rows.
-        # In this case, we calculate the index from the current frame.
+        # In this case, we copy the index from the current frame.
         if len(columns) == 0 and new_frame._index_cache is None:
-            if self._modin_frame._index_cache is not None:
-                new_frame._index_cache = self._modin_frame._index_cache
-            else:
-                # Lazy execution must be disabled before the index calculation
-                mode = self._modin_frame.force_execution_mode
-                self._modin_frame.force_execution_mode = None
-                new_frame._index_cache = self._modin_frame.index
-                self._modin_frame.force_execution_mode = mode
+            new_frame._index_cache = self._modin_frame.index.copy()
 
         return self.__constructor__(new_frame)
 
