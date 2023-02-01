@@ -5182,3 +5182,6 @@ class BaseQueryCompiler(ClassLogger, abc.ABC):
         return new_query_compiler
 
     # End of DataFrame methods
+
+    def _ensure_dtypes(self, df1, df2):
+        return df1

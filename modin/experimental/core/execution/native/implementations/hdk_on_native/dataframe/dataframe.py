@@ -12,6 +12,7 @@
 # governing permissions and limitations under the License.
 
 """Module provides ``HdkOnNativeDataframe`` class implementing lazy frame."""
+import pandas
 
 from modin.core.dataframe.pandas.dataframe.dataframe import PandasDataframe
 from modin.core.dataframe.base.dataframe.utils import Axis, JoinType
@@ -23,6 +24,7 @@ from modin.experimental.core.storage_formats.hdk.query_compiler import (
 )
 from .utils import (
     LazyProxyCategoricalDtype,
+    check_join_supported,
     encode_col_name,
     decode_col_name,
     IDX_COL_NAME,
@@ -31,7 +33,11 @@ from .utils import (
 from ..partitioning.partition_manager import HdkOnNativeDataframePartitionManager
 
 from pandas.core.indexes.api import ensure_index, Index, MultiIndex, RangeIndex
-from pandas.core.dtypes.common import get_dtype, is_list_like, is_bool_dtype
+from pandas.core.dtypes.common import (
+    get_dtype,
+    is_list_like,
+    is_bool_dtype,
+)
 from modin.error_message import ErrorMessage
 from modin.pandas.indexing import is_range_like
 from modin.utils import MODIN_UNNAMED_SERIES_LABEL
@@ -529,7 +535,10 @@ class HdkOnNativeDataframe(PandasDataframe):
 
         # TODO: check performance changes after enabling 'dropna' and decide
         # is it worth it or not.
-        # if groupby_args["dropna"]:
+        if groupby_args["dropna"]:
+            ErrorMessage.single_warning(
+                "'dropna' is temporary disabled due to https://github.com/modin-project/modin/issues/2896"
+            )
         #     base = base.dropna(subset=groupby_cols, how="any")
 
         if as_index:
@@ -1450,18 +1459,17 @@ class HdkOnNativeDataframe(PandasDataframe):
         assert len(self.columns) == 1
         assert self._dtypes[-1] == "category"
 
-        col = self.columns[-1]
         exprs = self._index_exprs()
-        col_expr = self.ref(col)
+        col_expr = self.ref(self.columns[-1])
         code_expr = OpExpr("KEY_FOR_STRING", [col_expr], get_dtype("int32"))
         null_val = LiteralExpr(np.int32(-1))
-        exprs[col] = build_if_then_else(
+        exprs[None] = build_if_then_else(
             col_expr.is_null(), null_val, code_expr, get_dtype("int32")
         )
 
         return self.__constructor__(
-            columns=self.columns,
-            dtypes=self._dtypes,
+            columns=Index([None]),
+            dtypes=pd.Series(self._dtypes[0], index=Index([None])),
             op=TransformNode(self, exprs),
             index=self._index_cache,
             index_cols=self._index_cols,

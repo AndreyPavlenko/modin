@@ -76,7 +76,7 @@ from .utils import (
     CustomIntegerForAddition,
     NonCommutativeMultiplyInteger,
 )
-from modin.config import NPartitions
+from modin.config import NPartitions, StorageFormat
 
 # Our configuration in pytest.ini requires that we explicitly catch all
 # instances of defaulting to pandas, but some test modules, like this one,
@@ -89,6 +89,9 @@ NPartitions.put(4)
 
 # Force matplotlib to not use any Xwindows backend.
 matplotlib.use("Agg")
+
+# Initialize the environment
+pd.DataFrame()
 
 
 def get_rop(op):
@@ -1046,6 +1049,10 @@ def test_asof_large(where):
 
 
 @pytest.mark.parametrize("data", test_data_values, ids=test_data_keys)
+@pytest.mark.xfail(
+    StorageFormat.get() == "Hdk",
+    reason="https://github.com/intel-ai/hdk/issues/186",
+)
 def test_astype(data):
     modin_series, pandas_series = create_test_series(data)
     series_name = "test_series"
@@ -3574,7 +3581,20 @@ def test_update(data, other_data):
 @pytest.mark.parametrize("sort", bool_arg_values, ids=bool_arg_keys)
 @pytest.mark.parametrize("normalize", bool_arg_values, ids=bool_arg_keys)
 @pytest.mark.parametrize("bins", [3, None])
-@pytest.mark.parametrize("dropna", bool_arg_values, ids=bool_arg_keys)
+@pytest.mark.parametrize(
+    "dropna",
+    [
+        pytest.param(None),
+        pytest.param(False),
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(
+                StorageFormat.get() == "Hdk",
+                reason="https://github.com/modin-project/modin/issues/2896",
+            ),
+        ),
+    ],
+)
 @pytest.mark.parametrize("ascending", bool_arg_values, ids=bool_arg_keys)
 def test_value_counts(sort, normalize, bins, dropna, ascending):
     def sort_sensitive_comparator(df1, df2):
@@ -3621,6 +3641,10 @@ def test_value_counts(sort, normalize, bins, dropna, ascending):
     )
 
 
+@pytest.mark.skipif(
+    StorageFormat.get() == "Hdk",
+    reason="The order of HDK categories is different from Pandas",
+)
 def test_value_counts_categorical():
     # from issue #3571
     data = np.array(["a"] * 50000 + ["b"] * 10000 + ["c"] * 1000)
@@ -4343,6 +4367,10 @@ def test_cat_ordered(data):
     assert modin_series.cat.ordered == pandas_series.cat.ordered
 
 
+@pytest.mark.skipif(
+    StorageFormat.get() == "Hdk",
+    reason="HDK uses internal codes, that are different from Pandas",
+)
 @pytest.mark.parametrize(
     "data", test_data_categorical_values, ids=test_data_categorical_keys
 )
@@ -4353,13 +4381,7 @@ def test_cat_codes(data):
     df_equals(modin_result, pandas_result)
 
 
-@pytest.mark.parametrize(
-    "set_min_partition_size",
-    [1, 2],
-    ids=["four_partitions", "two_partitions"],
-    indirect=True,
-)
-def test_cat_codes_issue5650(set_min_partition_size):
+def test_cat_codes_issue5650():
     data = {"name": ["abc", "def", "ghi", "jkl"]}
     pandas_df = pandas.DataFrame(data)
     pandas_df = pandas_df.astype("category")

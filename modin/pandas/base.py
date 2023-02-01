@@ -2813,11 +2813,14 @@ class BasePandasDataset(ClassLogger):
             if isinstance(self, DataFrame)
             else self.__constructor__(index=fill_index)
         )
+
         if fill_value is not None:
             filled_df.fillna(fill_value, inplace=True)
 
         if empty_frame:
             return filled_df
+
+        filled_df = self._query_compiler._ensure_dtypes(filled_df, self)
 
         if freq is None:
             if axis == "index" or axis == 0:
