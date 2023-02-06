@@ -2256,6 +2256,65 @@ class TestArrowExecution:
             drop_rename_concat,
             data=self.data1,
             data2=self.data2,
+            force_lazy=False,
+            force_arrow_execute=True,
+        )
+
+    @pytest.mark.parametrize("col_type", [None, "str"])
+    @pytest.mark.parametrize("df1_cols", [0, 90, 100])
+    @pytest.mark.parametrize("df2_cols", [0, 90, 100])
+    @pytest.mark.parametrize("df1_rows", [0, 100])
+    @pytest.mark.parametrize("df2_rows", [0, 100])
+    @pytest.mark.parametrize("idx_type", [None, "str"])
+    @pytest.mark.parametrize("ignore_index", [True, False])
+    @pytest.mark.parametrize("sort", [True, False])
+    @pytest.mark.parametrize("join", ["inner", "outer"])
+    def test_concat(
+        self,
+        col_type,
+        df1_cols,
+        df2_cols,
+        df1_rows,
+        df2_rows,
+        idx_type,
+        ignore_index,
+        sort,
+        join,
+    ):
+        def create_frame(frame_type, ncols, nrows):
+            def to_str(val):
+                return f"str_{val}"
+
+            off = 0
+            data = {}
+            for n in range(1, ncols + 1):
+                row = range(off + 1, off + nrows + 1)
+                if col_type == "str":
+                    row = map(to_str, row)
+                data[f"Col_{n}"] = list(row)
+                off += nrows
+
+            idx = None
+            if idx_type == "str":
+                idx = pandas.Index(
+                    map(to_str, range(1, nrows + 1)), name=f"Index_{nrows}"
+                )
+            df = frame_type(data=data, index=idx)
+            if isinstance(df, pd.DataFrame):
+                df._query_compiler.lazy_execution = False
+            return df
+
+        def concat(df, lib, **kwargs):
+            df1 = create_frame(type(df), df1_cols, df1_rows)
+            df2 = create_frame(type(df), df2_cols, df2_rows)
+            return lib.concat(
+                [df1, df2], ignore_index=ignore_index, sort=sort, join=join
+            )
+
+        run_and_compare(
+            concat,
+            data=[],
+            force_lazy=False,
             force_arrow_execute=True,
         )
 
