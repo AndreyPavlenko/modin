@@ -2304,8 +2304,7 @@ class HdkOnNativeDataframe(PandasDataframe):
         else:
             assert self._index_cols is None
             assert df.index.name is None, f"index name '{df.index.name}' is not None"
-            if (self._index_cache is not None) and (len(self.columns) == 0):
-                # Preserving index, because it could not be built from an empty frame.
+            if self._index_cache is not None:
                 df.index = self._index_cache.copy()
 
         # Restore original column labels encoded in HDK to meet its

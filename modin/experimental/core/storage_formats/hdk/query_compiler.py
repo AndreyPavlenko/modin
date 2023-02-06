@@ -573,7 +573,7 @@ class DFAlgQueryCompiler(BaseQueryCompiler):
         # If all columns are dropped and the index is trivial, we are
         # not able to restore it, since we don't know the number of rows.
         # In this case, we copy the index from the current frame.
-        if len(columns) == 0 and new_frame._index_cache is None:
+        if len(columns) == 0 and new_frame._index_cols is None:
             new_frame._index_cache = self._modin_frame.index.copy()
 
         return self.__constructor__(new_frame)
