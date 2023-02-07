@@ -88,6 +88,8 @@ def encode_col_name(
             if count != 0:
                 dst.append("_S")  # Separator
         return "".join(dst)
+    if len(name) == 0:
+        return "_E"
     if ignore_reserved and (name.startswith(IDX_COL_NAME) or name in _RESERVED_NAMES):
         return name
 
@@ -139,6 +141,8 @@ def decode_col_name(name: str) -> _COL_NAME_TYPE:
         if char == "T":
             dst = [decode_col_name(n) for n in name[2:].split("_S")]
             return tuple(dst)
+        if char == "E":
+            return ""
 
     idx = name.find("_Q")
     if idx == -1:

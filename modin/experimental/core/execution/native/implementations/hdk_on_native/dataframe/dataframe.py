@@ -28,6 +28,7 @@ from .utils import (
     IDX_COL_NAME,
     ROWID_COL_NAME,
 )
+from ..calcite_serializer import CalciteSerializer
 from ..partitioning.partition_manager import HdkOnNativeDataframePartitionManager
 
 from pandas.core.indexes.api import ensure_index, Index, MultiIndex, RangeIndex
@@ -771,6 +772,7 @@ class HdkOnNativeDataframe(PandasDataframe):
         """
         columns = col_dtypes.keys()
         new_dtypes = self._dtypes.copy()
+        supported_types = CalciteSerializer._DTYPE_STRINGS.keys()
         for column in columns:
             dtype = col_dtypes[column]
             if (
@@ -782,6 +784,9 @@ class HdkOnNativeDataframe(PandasDataframe):
                     new_dtype = np.dtype(dtype)
                 except TypeError:
                     new_dtype = dtype
+
+                if new_dtype.name not in supported_types:
+                    raise NotImplementedError(f"Cast to '{new_dtype.name}'")
 
                 if dtype != np.int32 and new_dtype == np.int32:
                     new_dtypes[column] = np.dtype("int64")
@@ -2727,6 +2732,13 @@ class HdkOnNativeDataframe(PandasDataframe):
         HdkOnNativeDataframe
             The new frame.
         """
+        null_type = pyarrow.null()
+
+        for i, col in enumerate(at.columns):
+            if col.type == null_type:
+                at = at.set_column(i, col._name, col.cast(pyarrow.float64()))
+
+
         (
             new_frame,
             new_lengths,
