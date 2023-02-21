@@ -2066,9 +2066,8 @@ def test___setitem__partitions_aligning():
 def test___setitem__with_mismatched_partitions():
     with ensure_clean(".csv") as fname:
         np.savetxt(fname, np.random.randint(0, 100, size=(200_000, 99)), delimiter=",")
-        # Use header=None to avoid duplicate column names
-        modin_df = pd.read_csv(fname, header=None)
-        pandas_df = pandas.read_csv(fname, header=None)
+        modin_df = pd.read_csv(fname)
+        pandas_df = pandas.read_csv(fname)
         modin_df["new"] = pd.Series(list(range(len(modin_df))))
         pandas_df["new"] = pandas.Series(list(range(len(pandas_df))))
         df_equals(modin_df, pandas_df)
