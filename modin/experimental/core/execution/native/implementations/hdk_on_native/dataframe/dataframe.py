@@ -1894,6 +1894,11 @@ class HdkOnNativeDataframe(PandasDataframe):
                     index_df.set_index(self._index_cols, inplace=True)
                     idx = index_df.index
                     idx.rename(self._index_names(self._index_cols), inplace=True)
+                    if (
+                        isinstance(idx, (pd.DatetimeIndex, pd.TimedeltaIndex))
+                        and len(idx) > 3
+                    ):
+                        idx.freq = pd.infer_freq(idx)
                     self._index_cache = idx
 
     def _get_index(self):
