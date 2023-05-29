@@ -15,9 +15,24 @@
 
 import abc
 
-from .dataframe.utils import ColNameCodec
-from .expr import InputRefExpr
+import typing
+from typing import TYPE_CHECKING, List, Dict, Union
 from collections import OrderedDict
+
+import pandas
+from pandas.core.dtypes.common import is_string_dtype
+
+import numpy as np
+import pyarrow as pa
+
+from modin.utils import _inherit_docstrings
+from modin.pandas.indexing import is_range_like
+
+from .expr import InputRefExpr, LiteralExpr, OpExpr
+from .dataframe.utils import ColNameCodec, empty_arrow_table, get_common_arrow_type
+
+if TYPE_CHECKING:
+    from .dataframe.dataframe import HdkOnNativeDataframe
 
 
 class TransformMapper:
@@ -221,6 +236,47 @@ class DFAlgNode(abc.ABC):
         self.walk_dfs(lambda a, b: a._append_frames(b), frames)
         return frames
 
+    def require_executed_base(self) -> bool:
+        """
+        Check if materialization of input frames is required.
+
+        Returns
+        -------
+        bool
+        """
+        return False
+
+    def can_execute_arrow(self) -> bool:
+        """
+        Check for possibility of Arrow execution.
+
+        Check if the computation can be executed using
+        the Arrow API instead of HDK query.
+
+        Returns
+        -------
+        bool
+        """
+        return False
+
+    def execute_arrow(
+        self, arrow_input: Union[None, pa.Table, List[pa.Table]]
+    ) -> pa.Table:
+        """
+        Compute the frame data using the Arrow API.
+
+        Parameters
+        ----------
+        arrow_input : None, pa.Table or list of pa.Table
+            The input, converted to arrow.
+
+        Returns
+        -------
+        pyarrow.Table
+            The resulting table.
+        """
+        raise RuntimeError(f"Arrow execution is not supported by {type(self)}")
+
     def _append_partitions(self, partitions):
         """
         Append all used by the node partitions to `partitions` list.
@@ -341,8 +397,44 @@ class FrameNode(DFAlgNode):
         Referenced frame.
     """
 
-    def __init__(self, modin_frame):
+    def __init__(self, modin_frame: "HdkOnNativeDataframe"):
         self.modin_frame = modin_frame
+
+    @_inherit_docstrings(DFAlgNode.can_execute_arrow)
+    def can_execute_arrow(self) -> bool:
+        frame = self.modin_frame
+        return not frame._has_unsupported_data and all(
+            p.arrow_table is not None for p in frame._partitions.flatten()
+        )
+
+    def execute_arrow(self, ignore=None) -> Union[pa.Table, pandas.DataFrame]:
+        """
+        Materialized frame.
+
+        If `can_execute_arrow` returns True, this method returns an arrow table,
+        otherwise - a pandas Dataframe.
+
+        Parameters
+        ----------
+        ignore : None, pa.Table or list of pa.Table, default: None
+
+        Returns
+        -------
+        pa.Table or pandas.Dataframe
+        """
+        frame = self.modin_frame
+        if frame._partitions.size != 0:
+            return frame._partitions[0][0].get()
+        elif frame._has_unsupported_data:
+            return pandas.DataFrame(
+                index=frame._index_cache, columns=frame._columns_cache
+            )
+        elif frame._index_cache or frame._columns_cache:
+            return pa.Table.from_pandas(
+                pandas.DataFrame(index=frame._index_cache, columns=frame._columns_cache)
+            )
+        else:
+            return empty_arrow_table()
 
     def copy(self):
         """
@@ -398,7 +490,7 @@ class MaskNode(DFAlgNode):
 
     Parameters
     ----------
-    base : DFAlgNode
+    base : HdkOnNativeDataframe
         A filtered frame.
     row_labels : list, optional
         List of row labels to select.
@@ -407,7 +499,7 @@ class MaskNode(DFAlgNode):
 
     Attributes
     ----------
-    input : list of DFAlgNode
+    input : list of HdkOnNativeDataframe
         Holds a single filtered frame.
     row_labels : list or None
         List of row labels to select.
@@ -415,10 +507,58 @@ class MaskNode(DFAlgNode):
         List of rows ids to select.
     """
 
-    def __init__(self, base, row_labels=None, row_positions=None):
+    def __init__(
+        self,
+        base: "HdkOnNativeDataframe",
+        row_labels: List[str] = None,
+        row_positions: List[int] = None,
+    ):
         self.input = [base]
         self.row_labels = row_labels
         self.row_positions = row_positions
+
+    @_inherit_docstrings(DFAlgNode.require_executed_base)
+    def require_executed_base(self) -> bool:
+        return True
+
+    @_inherit_docstrings(DFAlgNode.can_execute_arrow)
+    def can_execute_arrow(self) -> bool:
+        return self.row_labels is None
+
+    def execute_arrow(self, table: pa.Table) -> pa.Table:
+        """
+        Perform row selection on the frame using Arrow API.
+
+        Parameters
+        ----------
+        table : pa.Table
+
+        Returns
+        -------
+        pyarrow.Table
+            The resulting table.
+        """
+        row_positions = self.row_positions
+
+        if not isinstance(row_positions, slice) and not is_range_like(row_positions):
+            if not isinstance(row_positions, (pa.Array, np.ndarray, list)):
+                row_positions = pa.array(row_positions)
+            return table.take(row_positions)
+
+        if isinstance(row_positions, slice):
+            row_positions = range(*row_positions.indices(table.num_rows))
+
+        start, stop, step = (
+            row_positions.start,
+            row_positions.stop,
+            row_positions.step,
+        )
+
+        if step == 1:
+            return table.slice(start, len(row_positions))
+        else:
+            indices = np.arange(start, stop, step)
+            return table.take(indices)
 
     def copy(self):
         """
@@ -524,64 +664,64 @@ class TransformNode(DFAlgNode):
 
     Parameters
     ----------
-    base : DFAlgNode
+    base : HdkOnNativeDataframe
         A transformed frame.
     exprs : dict
         Expressions for frame's columns computation.
-    fold : bool, default: True
-        If True and `base` is another `TransformNode`, then translate all
-        expressions in `expr` to its base.
 
     Attributes
     ----------
-    input : list of DFAlgNode
+    input : list of HdkOnNativeDataframe
         Holds a single projected frame.
     exprs : dict
         Expressions used to compute frame's columns.
-    _original_refs : set
-        Set of columns expressed with `InputRefExpr` prior folding.
     """
 
-    def __init__(self, base, exprs, fold=True):
-        self.exprs = exprs
-        self.input = [base]
-        self._original_refs = None
+    def __init__(
+        self,
+        base: "HdkOnNativeDataframe",
+        exprs: Dict[str, Union[InputRefExpr, LiteralExpr, OpExpr]],
+    ):
+        # If base of this node is another `TransformNode`, then translate all
+        # expressions in `expr` to its base.
+        if fold := isinstance(base._op, TransformNode):
+            new_exprs = translate_exprs_to_base(exprs, base._op.input[0])
+            base_exprs = base._op.exprs
+            for col, expr in new_exprs.items():
+                if (base_expr := base_exprs.get(col, None)) is not None:
+                    if (expr := base_expr.fold(expr)) is None:
+                        fold = False
+                        break
+                    else:
+                        new_exprs[col] = expr
+
         if fold:
-            self.fold()
+            self.input = [base._op.input[0]]
+            self.exprs = new_exprs
+        else:
+            self.input = [base]
+            self.exprs = exprs
 
-    def fold(self):
+    @_inherit_docstrings(DFAlgNode.can_execute_arrow)
+    def can_execute_arrow(self) -> bool:
+        return all(expr.can_execute_arrow() for expr in self.exprs.values())
+
+    def execute_arrow(self, table: pa.Table) -> pa.Table:
         """
-        Fold two ``TransformNode``-s.
-
-        If base of this node is another `TransformNode`, then translate all
-        expressions in `expr` to its base.
-        """
-        if isinstance(self.input[0]._op, TransformNode):
-            self._original_refs = {
-                col for col in self.exprs if isinstance(self.exprs[col], InputRefExpr)
-            }
-            self.input[0] = self.input[0]._op.input[0]
-            self.exprs = translate_exprs_to_base(self.exprs, self.input[0])
-
-    def is_original_ref(self, col):
-        """
-        Check original column expression type.
-
-        Return True if `col` is an ``InputRefExpr`` expression or originally was
-        an ``InputRefExpr`` expression before folding.
+        Perform column selection on the frame using Arrow API.
 
         Parameters
         ----------
-        col : str
-            Column name.
+        table : pa.Table
 
         Returns
         -------
-        bool
+        pyarrow.Table
+            The resulting table.
         """
-        if self._original_refs is not None:
-            return col in self._original_refs
-        return isinstance(self.exprs[col], InputRefExpr)
+        cols = [expr.execute_arrow(table) for expr in self.exprs.values()]
+        names = [ColNameCodec.encode(c) for c in self.exprs]
+        return pa.table(cols, names)
 
     def copy(self):
         """
@@ -591,7 +731,7 @@ class TransformNode(DFAlgNode):
         -------
         TransformNode
         """
-        return TransformNode(self.input[0], self.exprs, self.keep_index)
+        return TransformNode(self.input[0], self.exprs)
 
     def is_simple_select(self):
         """
@@ -620,8 +760,6 @@ class TransformNode(DFAlgNode):
         str
         """
         res = f"{prefix}TransformNode:\n"
-        if self._original_refs is not None:
-            res += f"{prefix}  Original refs: {self._original_refs}\n"
         for k, v in self.exprs.items():
             res += f"{prefix}  {k}: {v}\n"
         res += self._prints_input(prefix + "  ")
@@ -719,26 +857,102 @@ class UnionNode(DFAlgNode):
 
     Parameters
     ----------
-    frames : list of DFAlgNode
+    frames : list of HdkOnNativeDataframe
         Input frames.
-    join : str
-        Either outer or inner.
-    sort : bool
-        Sort columns.
+    columns : dict
+        Column names and dtypes.
     ignore_index : bool
-        Ignore index columns.
 
     Attributes
     ----------
-    input : list of DFAlgNode
+    input : list of HdkOnNativeDataframe
         Input frames.
     """
 
-    def __init__(self, frames, join, sort, ignore_index):
+    def __init__(
+        self,
+        frames: List["HdkOnNativeDataframe"],
+        columns: Dict[str, np.dtype],
+        ignore_index: bool,
+    ):
         self.input = frames
-        self.join = join
-        self.sort = sort
+        self.columns = columns
         self.ignore_index = ignore_index
+
+    @_inherit_docstrings(DFAlgNode.require_executed_base)
+    def require_executed_base(self) -> bool:
+        # In case of different number of columns, HDK performs
+        # slowly and supports only numeric column types.
+        # See https://github.com/intel-ai/hdk/issues/182
+        # To work around this issue, perform concatenation
+        # with arrow.
+        if len(self.input) == 0 or len(self.columns) == 0:
+            return True
+        dtypes = self.input[0]._dtypes.to_dict()
+        if any(is_string_dtype(t) for t in dtypes.values()) or any(
+            f._dtypes.to_dict() != dtypes for f in self.input[1:]
+        ):
+            return True
+
+        return False
+
+    @_inherit_docstrings(DFAlgNode.can_execute_arrow)
+    def can_execute_arrow(self) -> bool:
+        return all(f._can_execute_arrow() for f in self.input)
+
+    def execute_arrow(self, tables: Union[pa.Table, List[pa.Table]]) -> pa.Table:
+        """
+        Concat frames' rows using Arrow API.
+
+        Parameters
+        ----------
+        tables : pa.Table or list of pa.Table
+
+        Returns
+        -------
+        pyarrow.Table
+            The resulting table.
+        """
+        if len(self.columns) == 0:
+            frames = self.input
+            if len(frames) == 0:
+                return empty_arrow_table()
+            elif self.ignore_index:
+                idx = pandas.RangeIndex(0, sum(len(frame.index) for frame in frames))
+            else:
+                idx = frames[0].index.append([f.index for f in frames[1:]])
+            idx_cols = ColNameCodec.mangle_index_names(idx.names)
+            idx_df = pandas.DataFrame(index=idx).reset_index()
+            obj_cols = idx_df.select_dtypes(include=["object"]).columns.tolist()
+            if len(obj_cols) != 0:
+                # PyArrow fails to convert object fields. Converting to str.
+                idx_df[obj_cols] = idx_df[obj_cols].astype(str)
+            idx_table = pa.Table.from_pandas(idx_df, preserve_index=False)
+            return idx_table.rename_columns(idx_cols)
+
+        if isinstance(tables, pa.Table):
+            assert len(self.input) == 1
+            return tables
+
+        try:
+            return pa.concat_tables(tables)
+        except pa.lib.ArrowInvalid:
+            # Probably, some tables have different column types.
+            # Trying to find a common type and cast the columns.
+            fields: typing.OrderedDict[str, pa.Field] = OrderedDict()
+            for table in tables:
+                for col_name in table.column_names:
+                    field = table.field(col_name)
+                    cur_field = fields.get(col_name, None)
+                    if cur_field is None or (
+                        cur_field.type
+                        != get_common_arrow_type(cur_field.type, field.type)
+                    ):
+                        fields[col_name] = field
+            schema = pa.schema(list(fields.values()))
+            for i, table in enumerate(tables):
+                tables[i] = pa.table(table.columns, schema=schema)
+            return pa.concat_tables(tables)
 
     def copy(self):
         """
@@ -925,7 +1139,7 @@ def translate_exprs_to_base(exprs, base):
             mapper.add_mapper(frame, TransformMapper(frame._op))
 
         for k, v in new_exprs.items():
-            new_expr = new_exprs[k].translate_input(mapper)
+            new_expr = v.translate_input(mapper)
             new_expr.collect_frames(new_frames)
             new_exprs[k] = new_expr
 

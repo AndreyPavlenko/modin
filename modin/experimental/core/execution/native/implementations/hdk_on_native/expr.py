@@ -14,8 +14,12 @@
 """Module provides classes for scalar expression trees."""
 
 import abc
+from typing import Type
+import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
 
-import pandas as pd
+import pandas
 from pandas.core.dtypes.common import (
     is_list_like,
     get_dtype,
@@ -27,7 +31,9 @@ from pandas.core.dtypes.common import (
     is_datetime64_any_dtype,
     is_bool_dtype,
 )
-import numpy as np
+
+from modin.utils import _inherit_docstrings
+from .dataframe.utils import ColNameCodec, to_arrow_type
 
 
 def _get_common_dtype(lhs_dtype, rhs_dtype):
@@ -607,6 +613,56 @@ class BaseExpr(abc.ABC):
         """
         return self
 
+    def fold(self, other: Type["BaseExpr"]):
+        """
+        Fold `self` and `other` expressions.
+
+        Parameters
+        ----------
+        other : BaseExpr
+
+        Returns
+        -------
+        BaseExpr or None
+
+        Returns either a new expressions or None, if this operation
+        is not supported for the specified expressions.
+        """
+        return (
+            self
+            if isinstance(other, InputRefExpr)
+            else other
+            if isinstance(other, LiteralExpr)
+            else None
+        )
+
+    def can_execute_arrow(self) -> bool:
+        """
+        Check for possibility of Arrow execution.
+
+        Check if the computation can be executed using
+        the Arrow API instead of HDK query.
+
+        Returns
+        -------
+        bool
+        """
+        return False
+
+    def execute_arrow(self, table: pa.Table) -> pa.ChunkedArray:
+        """
+        Compute the column data using the Arrow API.
+
+        Parameters
+        ----------
+        table : pa.Table
+
+        Returns
+        -------
+        pa.ChunkedArray
+        """
+        raise RuntimeError(f"Arrow execution is not supported by {type(self)}")
+
 
 class InputRefExpr(BaseExpr):
     """
@@ -673,6 +729,26 @@ class InputRefExpr(BaseExpr):
         """
         return mapper.translate(self)
 
+    @_inherit_docstrings(BaseExpr.fold)
+    def fold(self, other: Type[BaseExpr]):
+        if isinstance(other, InputRefExpr):
+            return self
+        elif isinstance(other, (LiteralExpr, OpExpr)):
+            return other
+        else:
+            return None
+
+    @_inherit_docstrings(BaseExpr.can_execute_arrow)
+    def can_execute_arrow(self) -> bool:
+        return True
+
+    @_inherit_docstrings(BaseExpr.execute_arrow)
+    def execute_arrow(self, table: pa.Table) -> pa.ChunkedArray:
+        name = self.column
+        if name == ColNameCodec.ROWID_COL_NAME:
+            return pa.chunked_array([range(len(table))], pa.int64())
+        return table.column(ColNameCodec.encode(name))
+
     def __repr__(self):
         """
         Return a string representation of the expression.
@@ -692,6 +768,8 @@ class LiteralExpr(BaseExpr):
     ----------
     val : int, np.int, float, bool, str or None
         Literal value.
+    dtype : None or dtype, default: None
+        Value dtype.
 
     Attributes
     ----------
@@ -701,30 +779,32 @@ class LiteralExpr(BaseExpr):
         Literal data type.
     """
 
-    def __init__(self, val):
-        if val is not None and not isinstance(
-            val,
-            (
-                int,
-                float,
-                bool,
-                str,
-                np.int8,
-                np.int16,
-                np.int32,
-                np.int64,
-                np.uint8,
-                np.uint16,
-                np.uint32,
-                np.uint64,
-            ),
-        ):
-            raise NotImplementedError(f"Literal value {val} of type {type(val)}")
+    def __init__(self, val, dtype=None):
+        if dtype is None:
+            if val is not None and not isinstance(
+                val,
+                (
+                    int,
+                    float,
+                    bool,
+                    str,
+                    np.int8,
+                    np.int16,
+                    np.int32,
+                    np.int64,
+                    np.uint8,
+                    np.uint16,
+                    np.uint32,
+                    np.uint64,
+                ),
+            ):
+                raise NotImplementedError(f"Literal value {val} of type {type(val)}")
+            if val is None:
+                dtype = get_dtype(float)
+            else:
+                dtype = get_dtype(type(val))
         self.val = val
-        if val is None:
-            self._dtype = get_dtype(float)
-        else:
-            self._dtype = get_dtype(type(val))
+        self._dtype = dtype
 
     def copy(self):
         """
@@ -735,6 +815,32 @@ class LiteralExpr(BaseExpr):
         LiteralExpr
         """
         return LiteralExpr(self.val)
+
+    @_inherit_docstrings(BaseExpr.fold)
+    def fold(self, other: Type[BaseExpr]):
+        if isinstance(other, InputRefExpr):
+            return self
+        elif isinstance(other, LiteralExpr):
+            return other
+        elif isinstance(other, OpExpr):
+            op = other.op
+            if op == "IS NULL":
+                return LiteralExpr(pandas.isnull(self.val))
+            elif op == "IS NOT NULL":
+                return LiteralExpr(not pandas.isnull(self.val))
+            elif op == "CAST":
+                if self._dtype == other._dtype:
+                    return self
+                return LiteralExpr(np.dtype(other._dtype).type(self.val))
+        return None
+
+    @_inherit_docstrings(BaseExpr.can_execute_arrow)
+    def can_execute_arrow(self) -> bool:
+        return True
+
+    @_inherit_docstrings(BaseExpr.execute_arrow)
+    def execute_arrow(self, table: pa.Table) -> pa.ChunkedArray:
+        return pa.chunked_array([[self.val] * len(table)], to_arrow_type(self._dtype))
 
     def __repr__(self):
         """
@@ -772,6 +878,12 @@ class OpExpr(BaseExpr):
         Result data type.
     """
 
+    _ARROW_EXEC = {
+        "IS NULL": lambda o, t: o.col(t).is_null(nan_is_null=True),
+        "IS NOT NULL": lambda o, t: pc.invert(o.col(t).is_null(nan_is_null=True)),
+        "CAST": lambda o, t: o.col(t).cast(to_arrow_type(o._dtype)),
+    }
+
     def __init__(self, op, operands, dtype):
         self.op = op
         self.operands = operands
@@ -787,6 +899,16 @@ class OpExpr(BaseExpr):
         """
         return OpExpr(self.op, self.operands.copy(), self._dtype)
 
+    @_inherit_docstrings(BaseExpr.can_execute_arrow)
+    def can_execute_arrow(self) -> bool:
+        return self.op in self._ARROW_EXEC and isinstance(
+            self.operands[0], InputRefExpr
+        )
+
+    @_inherit_docstrings(BaseExpr.execute_arrow)
+    def execute_arrow(self, table: pa.Table) -> pa.ChunkedArray:
+        return self._ARROW_EXEC[self.op](self, table)
+
     def __repr__(self):
         """
         Return a string representation of the expression.
@@ -798,6 +920,25 @@ class OpExpr(BaseExpr):
         if len(self.operands) == 1:
             return f"({self.op} {self.operands[0]} [{self._dtype}])"
         return f"({self.op} {self.operands} [{self._dtype}])"
+
+    def col(self: "OpExpr", table: pa.Table) -> pa.ChunkedArray:
+        """
+        Return the column referenced by the `InputRefExpr` operand.
+
+        Parameters
+        ----------
+        table : pa.Table
+
+        Returns
+        -------
+        pa.ChunkedArray
+        """
+        ref = self.operands[0]
+        assert isinstance(ref, InputRefExpr)
+        if ref.column == ColNameCodec.ROWID_COL_NAME:
+            return pa.chunked_array([range(len(table))], pa.int64())
+        else:
+            return table.column(ref.column)
 
 
 class AggregateExpr(BaseExpr):
@@ -882,7 +1023,7 @@ def build_row_idx_filter_expr(row_idx, row_col):
     if not is_list_like(row_idx):
         return row_col.eq(row_idx)
 
-    if isinstance(row_idx, (pd.RangeIndex, range)) and row_idx.step == 1:
+    if isinstance(row_idx, (pandas.RangeIndex, range)) and row_idx.step == 1:
         exprs = [row_col.ge(row_idx[0]), row_col.le(row_idx[-1])]
         return OpExpr("AND", exprs, get_dtype(bool))
 

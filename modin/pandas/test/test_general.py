@@ -46,9 +46,15 @@ def _nullcontext():
 
 
 @pytest.mark.parametrize("data", test_data_values, ids=test_data_keys)
-def test_isna(data):
+@pytest.mark.parametrize("append_na", [True, False])
+def test_isna(data, append_na):
     pandas_df = pandas.DataFrame(data)
-    modin_df = pd.DataFrame(data)
+    modin_df = pd.DataFrame(pandas_df)
+    if append_na:
+        pandas_df["NONE_COL"] = None
+        pandas_df["NAN_COL"] = np.nan
+        modin_df["NONE_COL"] = None
+        modin_df["NAN_COL"] = np.nan
 
     pandas_result = pandas.isna(pandas_df)
     modin_result = pd.isna(modin_df)
