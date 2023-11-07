@@ -21,6 +21,10 @@ import asyncio
 
 import ray
 
+from modin.core.execution.ray.common.deferred_execution import (
+    DeferredExecutionException,
+)
+
 
 @ray.remote
 def _deploy_ray_func(func, *args, **kwargs):  # pragma: no cover
@@ -89,7 +93,12 @@ class RayWrapper:
         object
             Whatever was identified by `obj_id`.
         """
-        return ray.get(obj_id)
+        if isinstance(obj_id, (list, tuple)):
+            return [cls.materialize(o) for o in obj_id]
+        obj = ray.get(obj_id)
+        if isinstance(obj, DeferredExecutionException):
+            raise obj.args[1] from obj
+        return obj
 
     @classmethod
     def put(cls, data, **kwargs):

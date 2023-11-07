@@ -37,8 +37,6 @@ class PyarrowOnRayDataframePartition(PandasOnRayDataframePartition):
         Width or reference to it of wrapped ``pyarrow.Table``.
     ip : ray.ObjectRef or str, optional
         Node IP address or reference to it that holds wrapped ``pyarrow.Table``.
-    call_queue : list, optional
-        Call queue that needs to be executed on wrapped ``pyarrow.Table``.
     """
 
     @classmethod
