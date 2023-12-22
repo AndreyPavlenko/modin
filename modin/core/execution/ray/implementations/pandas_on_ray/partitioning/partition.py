@@ -74,8 +74,12 @@ class PandasOnRayDataframePartition(PandasDataframePartition):
 
     def __del__(self):
         """Decrement the reference counter."""
-        if isinstance(self._data_ref, DeferredExecution):
-            self._data_ref.ref_count(-1)
+        data = self._data_ref
+        if isinstance(data, DeferredExecution):
+            data.ref_count(-1)
+            if data.ref_counter > 1:
+                data.exec()
+
 
     def apply(self, func: Callable, *args, **kwargs):
         """
