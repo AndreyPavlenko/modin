@@ -827,7 +827,7 @@ class LazyExecution(EnvironmentVariable, type=bool):
     """Prefer the lazy execution, when it's possible."""
 
     varname = "MODIN_LAZY_EXECUTION"
-    default = False
+    default = True
 
 
 def _check_vars() -> None:
